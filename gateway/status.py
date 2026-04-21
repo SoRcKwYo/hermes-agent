@@ -259,6 +259,11 @@ def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
     if not cleanup_stale:
         return
     try:
+        # Unlink directly — we have already confirmed the recorded PID is dead,
+        # so the ownership check inside remove_pid_file() must NOT run here.
+        # (remove_pid_file's ownership guard exists only for the atexit case
+        # where an old process's atexit fires after a new process has written
+        # its own PID; that scenario is irrelevant when the process is dead.)
         pid_path.unlink(missing_ok=True)
     except Exception:
         pass

@@ -4814,7 +4814,9 @@ class AIAgent:
            Claude-style models sometimes tack on (TodoTool_tool ->
            TodoTool -> Todo -> todo). Applied twice so double-tacked
            suffixes like ``TodoTool_tool`` reduce all the way.
-        5. Fuzzy match (difflib, cutoff=0.7).
+        5. Prefix match — handles repeated names like "terminalterminal"
+           or "browser_navigatebrowser_navigate" emitted by local models.
+        6. Fuzzy match (difflib, cutoff=0.7).
 
         See #14784 for the original reports (TodoTool_tool, Patch_tool,
         BrowserClick_tool were all returning "Unknown tool" before).
@@ -4865,7 +4867,24 @@ class AIAgent:
             if c and c in self.valid_tool_names:
                 return c
 
-        # Fuzzy match as last resort.
+        # 5. Prefix match: local models sometimes repeat the tool name
+        #    (e.g. "terminalterminal", "browser_navigatebrowser_navigate").
+        #    Find the longest valid tool name that is a prefix of the
+        #    hallucinated name — longest-first avoids false matches on
+        #    short prefixes like "run" inside "run_terminal_cmd_terminal".
+        prefix_candidates = sorted(
+            (name for name in self.valid_tool_names if normalized.startswith(name)),
+            key=len,
+            reverse=True,
+        )
+        if prefix_candidates:
+            logger.debug(
+                "Pre-call repair: '%s' starts with known tool '%s' — repaired",
+                tool_name, prefix_candidates[0],
+            )
+            return prefix_candidates[0]
+
+        # 6. Fuzzy match as last resort.
         matches = get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.7)
         if matches:
             return matches[0]

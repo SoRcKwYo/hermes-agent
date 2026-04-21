@@ -7054,7 +7054,26 @@ class GatewayRunner:
                 return False
 
         if not raw_args:
-            # Show current state
+            # For Telegram: show interactive inline keyboard picker
+            from gateway.config import Platform
+            if event.source.platform == Platform.TELEGRAM:
+                adapter = self.adapters.get(event.source.platform)
+                if adapter and hasattr(adapter, "send_reasoning_picker"):
+                    rc = self._reasoning_config
+                    current_level = (
+                        "none" if (rc and rc.get("enabled") is False)
+                        else (rc.get("effort", "medium") if rc else "medium")
+                    )
+                    meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                    await adapter.send_reasoning_picker(
+                        chat_id=event.source.chat_id or event.source.user_id,
+                        current_level=current_level,
+                        show_reasoning=self._show_reasoning,
+                        metadata=meta,
+                    )
+                    return ""
+
+            # Show current state (text fallback)
             rc = self._reasoning_config
             if rc is None:
                 level = "medium (default)"

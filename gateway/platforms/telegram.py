@@ -253,6 +253,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._approval_state: Dict[int, str] = {}
         # Commands picker state per chat
         self._commands_picker_state: Dict[str, dict] = {}
+        self._reasoning_picker_state: Dict[str, dict] = {}
 
     @staticmethod
     def _is_callback_user_authorized(user_id: str) -> bool:
@@ -1651,6 +1652,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_model_picker_callback(query, data, chat_id)
             return
 
+        # --- Reasoning picker callbacks (mr:...) ---
+        if data.startswith("mr:"):
+            chat_id = str(query.message.chat_id) if query.message else None
+            if chat_id:
+                await self._handle_reasoning_picker_callback(query, data, chat_id)
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -1935,6 +1943,159 @@ class TelegramAdapter(BasePlatformAdapter):
                 edit_message_id=state.get("message_id"),
             )
             await query.answer() if result.success else await query.answer(text="Failed to update picker.")
+            return
+
+        await query.answer()
+
+
+    # -------------------------------------------------------------------------
+    # Reasoning picker
+    # -------------------------------------------------------------------------
+
+    async def send_reasoning_picker(
+        self,
+        chat_id: str,
+        current_level: str,
+        show_reasoning: bool,
+        edit_message_id: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an inline keyboard picker for reasoning effort and display toggle."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        levels = ["none", "minimal", "low", "medium", "high", "xhigh"]
+        effort_buttons = [
+            InlineKeyboardButton(
+                f"{'✅ ' if l == current_level else ''}{l}",
+                callback_data=f"mr:level:{l}",
+            )
+            for l in levels
+        ]
+        effort_rows = [effort_buttons[i : i + 2] for i in range(0, len(effort_buttons), 2)]
+        display_btn_label = "🖥 Hide Reasoning" if show_reasoning else "🖥 Show Reasoning"
+        keyboard = InlineKeyboardMarkup(
+            effort_rows
+            + [[InlineKeyboardButton(display_btn_label, callback_data="mr:display:toggle")]]
+            + [[InlineKeyboardButton("✓ Done", callback_data="mr:done")]]
+        )
+        caption = (f"🧠 **Reasoning Settings**\n\n**Effort:** `{current_level}`\n**Display:** {'on ✓' if show_reasoning else 'off'}\n\n_Tap a level to set it, or toggle display, then Done._")
+        try:
+            if edit_message_id is not None:
+                await self._bot.edit_message_text(
+                    chat_id=int(chat_id),
+                    message_id=edit_message_id,
+                    text=caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard,
+                )
+                msg_id = edit_message_id
+            else:
+                msg = await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text=caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard,
+                    message_thread_id=self._message_thread_id_for_send(
+                        self._metadata_thread_id(metadata)
+                    ),
+                )
+                msg_id = msg.message_id
+            self._reasoning_picker_state[chat_id] = {
+                "current_level": current_level,
+                "show_reasoning": show_reasoning,
+                "message_id": msg_id,
+            }
+            return SendResult(success=True, message_id=str(msg_id))
+        except Exception as exc:
+            logger.error("Failed to send reasoning picker: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _handle_reasoning_picker_callback(
+        self, query: "CallbackQuery", data: str, chat_id: str
+    ) -> None:
+        """Handle inline keyboard callbacks from the reasoning picker."""
+        state = self._reasoning_picker_state.get(chat_id, {})
+        level = state.get("current_level", "medium")
+        show_reasoning = state.get("show_reasoning", False)
+
+        if data.startswith("mr:level:"):
+            selected = data.split(":", 2)[-1]
+            level = selected
+            try:
+                import yaml
+                config_path = self._hermes_config_path()
+                user_config = {}
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        user_config = yaml.safe_load(f) or {}
+                keys = ["agent", "reasoning_effort"]
+                current = user_config
+                for k in keys[:-1]:
+                    if k not in current or not isinstance(current[k], dict):
+                        current[k] = {}
+                    current = current[k]
+                current[keys[-1]] = level
+                self._atomic_yaml_write(config_path, user_config)
+            except Exception as exc:
+                logger.warning("Failed to save reasoning level: %s", exc)
+            result = await self.send_reasoning_picker(
+                chat_id=chat_id,
+                current_level=level,
+                show_reasoning=show_reasoning,
+                edit_message_id=state.get("message_id"),
+            )
+            await query.answer(f"Effort: {level}") if result.success else await query.answer(text="Failed to update.")
+            return
+
+        if data == "mr:display:toggle":
+            show_reasoning = not show_reasoning
+            try:
+                import yaml
+                config_path = self._hermes_config_path()
+                user_config = {}
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        user_config = yaml.safe_load(f) or {}
+                platform_key = self._resolve_platform_key_for_chat(chat_id)
+                keys = ["display", "platforms", platform_key, "show_reasoning"]
+                current = user_config
+                for k in keys[:-1]:
+                    if k not in current or not isinstance(current[k], dict):
+                        current[k] = {}
+                    current = current[k]
+                current[keys[-1]] = show_reasoning
+                self._atomic_yaml_write(config_path, user_config)
+            except Exception as exc:
+                logger.warning("Failed to save show_reasoning: %s", exc)
+            result = await self.send_reasoning_picker(
+                chat_id=chat_id,
+                current_level=level,
+                show_reasoning=show_reasoning,
+                edit_message_id=state.get("message_id"),
+            )
+            await query.answer("Display updated") if result.success else await query.answer(text="Failed to update.")
+            return
+
+        if data == "mr:done":
+            self._reasoning_picker_state.pop(chat_id, None)
+            text = (
+                f"🧠 **Reasoning saved**\n\n"
+                f"**Effort:** `{level}`\n"
+                f"**Display:** {'on ✓' if show_reasoning else 'off'}"
+            )
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=int(chat_id),
+                    message_id=state.get("message_id"),
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=None,
+                )
+            except Exception:
+                await query.answer(text=f"Saved! Effort={level}, Display={'on' if show_reasoning else 'off'}")
+                return
+            await query.answer("Saved!")
             return
 
         await query.answer()
